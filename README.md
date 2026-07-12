@@ -30,7 +30,11 @@ Desenvolver uma plataforma utilizando dados públicos do governo federal (dados.
 [![GitHub](https://img.shields.io/badge/GitHub-100000?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Lusilpa/de-olho-na-seguranca-do-trabalho)
 
 #### Fonte de Dados
-Os dados brutos utilizados nesta aplicação são extraídos do **Portal de Dados Abertos do Governo Federal** (dados.gov.br), especificamente a base histórica de Comunicações de Acidente de Trabalho (CAT).
+Os dados brutos utilizados nesta aplicação são extraídos do **Portal de Dados Abertos do Governo Federal** (dados.gov.br), especificamente a base histórica de Comunicações de Acidente de Trabalho (CAT). 
+
+Para facilitar a execução local e contornar os limites de tamanho do GitHub, a base de dados completa (2021 a 2026) foi consolidada e está disponível para download no link abaixo:
+
+[![Google Drive](https://img.shields.io/badge/Acessar_Base_de_Dados-4285F4?style=for-the-badge&logo=googledrive&logoColor=white)](https://drive.google.com/drive/folders/1mPm0ElAIwSM869zawrSZVeO8Dd84ic58?usp=drive_link)
 
 ## Funcionalidades Principais
 
@@ -115,7 +119,7 @@ http://localhost:5173
 
 ## 👨‍💻 Autor
 
-Desenvolvido por **Luan da Silva Palma**.
+Desenvolvido por **Luan Palma**.
 
 Engenharia de Software e Recursos Humanos andando juntos para criar soluções que impactam a rotina do Departamento Pessoal e a segurança dos colaboradores. Sinta-se à vontade para entrar em contato, tirar dúvidas ou contribuir com o projeto!
 
