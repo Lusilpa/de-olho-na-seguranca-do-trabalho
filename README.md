@@ -45,7 +45,7 @@ A Página principal do projeto conta com um dashboard demostrando os seguintes p
 
 Além disso, pode explorar mais ainda os dados na tela home
 
-### 2. Filtros Aplicados
+### 2. Filtros e Selos
 
 A seguranda funcionalidade e creio ser uma das principais, seja os filtros e selos.
 
