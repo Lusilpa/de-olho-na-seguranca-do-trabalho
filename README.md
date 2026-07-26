@@ -119,6 +119,12 @@ Todos os endpoints aceitam os parâmetros de filtro opcionais `cnae` e `uf`.
 
 ---
 
+# Diretriz de Desenvolvimento e Uso de IA
+
+Reafirma-se que este projeto foi elaborado inteiramente sob padrões e protocolos proprietários. O uso de inteligência artificial no ambiente Antigravity IDE da Google atuou estritamente como catalisador no desenvolvimento do Frontend e na geração de ideias visuais. Mantém-se o compromisso com a entrega de um produto que une o pensamento analítico humano à celeridade operacional das ferramentas de IA.
+
+Por conseguinte, todas as decisões estratégicas de Planejamento, Coleta e Tratamento de Dados, Arquitetura de Software e Ciência de Dados constituem, integralmente, propriedade intelectual humana.
+
 ## Licença
 
 [MIT](LICENSE) — Desenvolvido por **Luan Palma**.  
