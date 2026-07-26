@@ -1,29 +1,99 @@
-from fastapi import APIRouter, Path
-from app.services import data_service, cnpj_service
+"""
+cnpj.py
 
-router = APIRouter(tags=["CNPJ"])
+Router responsável pela consulta de empresas por CNPJ.
 
-@router.get("/api/cnpj/{cnpj}")
-async def buscar_cnpj(cnpj: str = Path(...)):
-    # 1. Limpeza da entrada (Responsabilidade da camada de interface)
+Combina duas fontes de dados:
+  1. BrasilAPI — dados cadastrais da Receita Federal (via cnpj_service)
+  2. Base interna de CATs — histórico de acidentes e Selo de Risco (via data_service)
+
+Rate limiting simples via cache em memória — evita bloqueio da BrasilAPI
+por excesso de requisições ao mesmo CNPJ em janelas curtas de tempo.
+"""
+
+import time
+from collections import defaultdict
+import pandas as pd
+from fastapi import APIRouter, HTTPException, Path, Request, Depends
+
+from app.services.cnpj_service import consultar_cnpj_na_receita_federal, extrair_dados_empresa
+from app.services.data_service import obter_historico_cnpj
+from app.api.deps import get_df_cat
+
+router = APIRouter(prefix="/api/cnpj", tags=["CNPJ"])
+
+# ── Cache simples em memória (TTL por CNPJ) ───────────────────────────────────
+# Estrutura: { cnpj: { "ts": timestamp, "data": resultado } }
+_cache: dict[str, dict] = {}
+_CACHE_TTL = 300  # 5 minutos
+
+# ── Rate limit por IP ─────────────────────────────────────────────────────────
+# Máximo de 10 requisições por minuto por IP
+_ip_requests: dict[str, list[float]] = defaultdict(list)
+_RATE_WINDOW = 60   # segundos
+_RATE_LIMIT = 10    # máximo de requisições por janela
+
+
+def _check_rate_limit(ip: str) -> None:
+    agora = time.time()
+    # Mantém apenas timestamps dentro da janela
+    _ip_requests[ip] = [ts for ts in _ip_requests[ip] if agora - ts < _RATE_WINDOW]
+    if len(_ip_requests[ip]) >= _RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Muitas requisições. Aguarde {_RATE_WINDOW} segundos e tente novamente.",
+        )
+    _ip_requests[ip].append(agora)
+
+
+@router.get("/{cnpj}", summary="Consulta empresa por CNPJ")
+def consultar_empresa(
+    request: Request,
+    cnpj: str = Path(
+        ...,
+        description="CNPJ da empresa (com ou sem formatação)",
+        min_length=14,
+        max_length=18,
+    ),
+    df_cat: pd.DataFrame = Depends(get_df_cat)
+):
+    """
+    Retorna dados cadastrais da empresa e seu histórico de CATs na base interna.
+
+    - **empresa**: dados da Receita Federal via BrasilAPI (pode ser null se CNPJ não encontrado)
+    - **risco**: Selo de Risco + total de CATs + histórico de ocorrências na base interna
+    - Resultado em cache por 5 minutos por CNPJ
+    - Rate limit: 10 req/min por IP
+    """
+    # Rate limiting por IP
+    ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(ip)
+
+    # Limpa o CNPJ para uso interno
     cnpj_limpo = "".join(filter(str.isdigit, cnpj))
 
-    # 2. Pede os dados e cálculos analíticos para o serviço interno
-    dados_locais = data_service.obter_historico_cnpj(cnpj_limpo)
+    if len(cnpj_limpo) != 14:
+        raise HTTPException(
+            status_code=422,
+            detail="CNPJ inválido. Informe os 14 dígitos numéricos.",
+        )
 
-    # Interrompe caso o motor de dados não tenha subido
-    if "erro" in dados_locais:
-        return dados_locais
+    # Cache hit — evita chamada desnecessária à BrasilAPI
+    agora = time.time()
+    cached = _cache.get(cnpj_limpo)
+    if cached and (agora - cached["ts"]) < _CACHE_TTL:
+        return cached["data"]
 
-    # 3. Orquestra a chamada para a API externa (Receita Federal)
-    dados_receita = cnpj_service.consultar_cnpj_na_receita_federal(cnpj_limpo)
-    dados_empresa = cnpj_service.extrair_dados_empresa(dados_receita)
+    # Consulta 1: dados cadastrais (BrasilAPI — pode falhar sem interromper)
+    dados_brutos = consultar_cnpj_na_receita_federal(cnpj_limpo)
+    empresa = extrair_dados_empresa(dados_brutos)
 
-    # 4. Monta o quebra-cabeça final e devolve para o React
-    return {
-        "cnpj": cnpj,
-        "registros": dados_locais["registros"],
-        "selo": dados_locais["selo"],
-        "historico": dados_locais["historico"],
-        "empresa": dados_empresa
-    }
+    # Consulta 2: histórico de CATs e Selo de Risco (base interna)
+    historico = obter_historico_cnpj(df_cat, cnpj_limpo)
+
+    resultado = {"empresa": empresa, "risco": historico}
+
+    # Salva no cache
+    _cache[cnpj_limpo] = {"ts": agora, "data": resultado}
+
+    return resultado

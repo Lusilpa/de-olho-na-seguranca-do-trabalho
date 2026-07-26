@@ -3,19 +3,40 @@ import glob
 import os
 import json
 from typing import Optional
+import functools
+import time
 
-# base de dados global em memória
-df_cat = pd.DataFrame()
+_CACHE = {}
+_CACHE_TTL = 3600 # 1 hora de cache em memória
 
-async def iniciar_motor_dados():
-    global df_cat
+def cache_query(func):
+    """
+    Decorator de cache customizado que ignora o primeiro argumento (df_cat)
+    para evitar o erro TypeError: unhashable type: 'DataFrame'.
+    O restante dos argumentos formam a chave do cache.
+    """
+    @functools.wraps(func)
+    def wrapper(df_cat, *args, **kwargs):
+        key = (func.__name__,) + args + tuple(sorted(kwargs.items()))
+        
+        now = time.time()
+        cached = _CACHE.get(key)
+        if cached and (now - cached['ts']) < _CACHE_TTL:
+            return cached['data']
+            
+        result = func(df_cat, *args, **kwargs)
+        _CACHE[key] = {'ts': now, 'data': result}
+        return result
+    return wrapper
+
+
+async def iniciar_motor_dados() -> pd.DataFrame:
     print("Iniciando o motor de dados... Lendo pastas e processando arquivos.")
 
     pasta_atual = os.path.dirname(os.path.abspath(__file__))
     caminho_data = os.path.join(pasta_atual, '..', '..', 'data')
     arquivos_json = glob.glob(os.path.join(caminho_data, '**', '*.json'), recursive=True)
 
-    # Para evitar sobrecarga da memória, uma lista de
     colunas_uteis = [
         'CNAE2.0 Empregador', 'UF Munic. Empregador', 'Munic Empr',
         'Data Acidente', 'CID-10', 'Indica Óbito Acidente', 'Data Afastamento',
@@ -23,7 +44,7 @@ async def iniciar_motor_dados():
         'CNPJ/CEI Empregador'
     ]
 
-    lista_registros = []
+    lista_dfs = []
 
     for arquivo in arquivos_json:
         print(f"Processando: {os.path.basename(arquivo)}...")
@@ -32,18 +53,35 @@ async def iniciar_motor_dados():
                 data = json.load(f)
 
             nodes = data.get('nodes', [])
+            if not nodes:
+                continue
+                
+            lista_temp = []
             for item in nodes:
                 node = item.get('node', {})
                 registro = {col: node.get(col, None) for col in colunas_uteis}
-                lista_registros.append(registro)
+                lista_temp.append(registro)
+                
+            # Criar DataFrame e remover duplicatas localmente economiza RAM no merge final
+            df_temp = pd.DataFrame(lista_temp).drop_duplicates()
+            lista_dfs.append(df_temp)
         except Exception as e:
             print(f"ALERTA: Falha ao ler {os.path.basename(arquivo)}: {e}")
             continue
 
-    if lista_registros:
+    if lista_dfs:
         print("Montando o quebra-cabeça...")
-        print("Aguarde...")
-        df_cat = pd.DataFrame(lista_registros)
+        print("Aguarde... Concatenando arquivos...")
+        df_cat = pd.concat(lista_dfs, ignore_index=True)
+        
+        # Otimizar tipos de dados para reduzir consumo de memória RAM absurdamente
+        print("Otimizando consumo de memória (dtypes)...")
+        colunas_categoria = ['UF Munic. Empregador', 'Sexo', 'Indica Óbito Acidente', 'Tipo do Acidente', 'Munic Empr']
+        for col in colunas_categoria:
+            if col in df_cat.columns:
+                df_cat[col] = df_cat[col].astype('category')
+
+        print("Removendo duplicatas globais...")
         df_cat = df_cat.drop_duplicates()
 
         # Pré-processamento de datas
@@ -52,15 +90,14 @@ async def iniciar_motor_dados():
         df_cat['Ano'] = df_cat['Data Acidente Date'].dt.year.fillna(0).astype(int).astype(str)
 
         print(f"Base consolidada! Total de registros limpos em memória: {len(df_cat)}")
+        return df_cat
     else:
         print("Nenhum arquivo JSON foi carregado.")
+        return pd.DataFrame()
 
 
-def aplicar_filtros(cnae: Optional[str], uf: Optional[str], df: pd.DataFrame = None) -> pd.DataFrame:
-    global df_cat
-    base_df = df if df is not None else df_cat
-
-    df_filtrado = base_df.copy()
+def aplicar_filtros(df_cat: pd.DataFrame, cnae: Optional[str] = None, uf: Optional[str] = None) -> pd.DataFrame:
+    df_filtrado = df_cat.copy()
     if cnae:
         df_filtrado = df_filtrado[
             df_filtrado['CNAE2.0 Empregador'].astype(str).str.contains(cnae, na=False, case=False)]
@@ -68,18 +105,74 @@ def aplicar_filtros(cnae: Optional[str], uf: Optional[str], df: pd.DataFrame = N
         df_filtrado = df_filtrado[df_filtrado['UF Munic. Empregador'].astype(str).str.upper() == uf.upper()]
     return df_filtrado
 
+
+def obter_registros(
+    df_cat: pd.DataFrame,
+    ano: Optional[str] = None,
+    uf: Optional[str] = None,
+    tipo: Optional[str] = None,
+    cid: Optional[str] = None,
+    pagina: int = 1,
+    por_pagina: int = 10,
+) -> dict:
+    """
+    Retorna registros reais de CAT paginados com filtros opcionais.
+    NÃO cachear paginação.
+    """
+    if df_cat.empty:
+        return {"total": 0, "pagina": pagina, "por_pagina": por_pagina, "total_paginas": 1, "registros": []}
+
+    df = df_cat.copy()
+
+    # Filtros
+    if ano and ano != "TODOS":
+        df = df[df["Ano"] == ano]
+    if uf:
+        df = df[df["UF Munic. Empregador"].astype(str).str.upper() == uf.upper()]
+    if tipo:
+        df = df[df["Tipo do Acidente"].astype(str).str.upper() == tipo.upper()]
+    if cid:
+        df = df[df["CID-10"].astype(str).str.upper().str.startswith(cid.upper())]
+
+    total = len(df)
+    inicio = (pagina - 1) * por_pagina
+    fim = inicio + por_pagina
+
+    pagina_df = df.iloc[inicio:fim]
+
+    registros = []
+    for _, row in pagina_df.iterrows():
+        registros.append({
+            "data_acidente": str(row.get("Data Acidente") or ""),
+            "uf": str(row.get("UF Munic. Empregador") or ""),
+            "municipio": str(row.get("Munic Empr") or ""),
+            "tipo": str(row.get("Tipo do Acidente") or ""),
+            "cid": str(row.get("CID-10") or ""),
+            "parte_corpo": str(row.get("Parte Corpo Atingida") or "").split("(")[0].strip()[:30],
+            "sexo": str(row.get("Sexo") or ""),
+            "obito": str(row.get("Indica Óbito Acidente") or "NÃO").upper() == "SIM",
+            "afastamento": bool(row.get("Data Afastamento")),
+        })
+
+    return {
+        "total": total,
+        "pagina": pagina,
+        "por_pagina": por_pagina,
+        "total_paginas": max(1, -(-total // por_pagina)),  # ceil division
+        "registros": registros,
+    }
+
+
 # FUNÇÕES DE PROCESSAMENTO DO DASHBOARD
 
-def obter_historico_cnpj(cnpj_limpo: str) -> dict:
-    global df_cat
+@cache_query
+def obter_historico_cnpj(df_cat: pd.DataFrame, cnpj_limpo: str) -> dict:
     if df_cat.empty:
-        return {"erro": "Base não inicializada"}
+        return {"registros": 0, "selo": "Base Vazia", "historico": []}
 
-    # Filtro de dados no Pandas
     df_filtrado = df_cat[df_cat['CNPJ/CEI Empregador'].astype(str).str.replace(r'\D', '', regex=True) == cnpj_limpo]
     registros = len(df_filtrado)
 
-    # Regra de negócio (Classificação de Risco/Selo)
     if registros == 0:
         selo = "Gama"
     elif registros < 10:
@@ -89,7 +182,6 @@ def obter_historico_cnpj(cnpj_limpo: str) -> dict:
     else:
         selo = "Sem Selo"
 
-    # Extração de histórico
     lista = []
     if registros > 0:
         lista = df_filtrado[['Data Acidente', 'CID-10', 'Tipo do Acidente']].head(10).to_dict('records')
@@ -100,20 +192,18 @@ def obter_historico_cnpj(cnpj_limpo: str) -> dict:
         "historico": lista
     }
 
-
-def obter_tipo_acidente(cnae: Optional[str] = None, uf: Optional[str] = None) -> list:
-    global df_cat
+@cache_query
+def obter_tipo_acidente(df_cat: pd.DataFrame, cnae: Optional[str] = None, uf: Optional[str] = None) -> list:
     if df_cat.empty:
         return []
 
-    df_filtrado = aplicar_filtros(cnae, uf)
+    df_filtrado = aplicar_filtros(df_cat, cnae, uf)
     total = len(df_filtrado)
     if total == 0:
         return []
 
     agrupado = df_filtrado['Tipo do Acidente'].value_counts()
-
-    resultado = [
+    return [
         {
             "name": str(k),
             "valorAbsoluto": f"{int(v / 1000)}k" if v >= 1000 else str(v),
@@ -122,41 +212,31 @@ def obter_tipo_acidente(cnae: Optional[str] = None, uf: Optional[str] = None) ->
         for k, v in agrupado.items()
     ]
 
-    return resultado
-
-
-def obter_setor_economico(uf: Optional[str] = None) -> list:
-    global df_cat
+@cache_query
+def obter_setor_economico(df_cat: pd.DataFrame, uf: Optional[str] = None) -> list:
     if df_cat.empty:
         return []
 
-    df_filtrado = aplicar_filtros(None, uf)
+    df_filtrado = aplicar_filtros(df_cat, None, uf)
     total = len(df_filtrado)
     if total == 0:
         return []
 
-    # Pega os 5 maiores e limita o nome do setor a 30 caracteres para não quebrar o layout no React
     agrupado = df_filtrado['CNAE2.0 Empregador'].value_counts().head(5)
-    resultado = [{"setor": str(k)[:30], "quantidade": int(v)} for k, v in agrupado.items()]
+    return [{"setor": str(k)[:30], "quantidade": int(v)} for k, v in agrupado.items()]
 
-    return resultado
-
-
-def obter_parte_corpo(cnae: Optional[str] = None, uf: Optional[str] = None) -> list:
-    global df_cat
+@cache_query
+def obter_parte_corpo(df_cat: pd.DataFrame, cnae: Optional[str] = None, uf: Optional[str] = None) -> list:
     if df_cat.empty:
         return []
 
-    df_filtrado = aplicar_filtros(cnae, uf)
+    df_filtrado = aplicar_filtros(df_cat, cnae, uf)
     total = len(df_filtrado)
     if total == 0:
         return []
 
-    # Pega os 5 maiores
     agrupado = df_filtrado['Parte Corpo Atingida'].value_counts().head(5)
-
-    # Limpa a string (tira parênteses, remove espaços e limita a 20 caracteres) e calcula a %
-    resultado = [
+    return [
         {
             "parte": str(k).split('(')[0].strip()[:20],
             "percentual": round((v / total) * 100, 1)
@@ -164,17 +244,14 @@ def obter_parte_corpo(cnae: Optional[str] = None, uf: Optional[str] = None) -> l
         for k, v in agrupado.items()
     ]
 
-    return resultado
-
-
-def obter_resumo_cats(cnae: Optional[str] = None, uf: Optional[str] = None) -> dict:
-    global df_cat
+@cache_query
+def obter_resumo_cats(df_cat: pd.DataFrame, cnae: Optional[str] = None, uf: Optional[str] = None) -> dict:
     if df_cat.empty:
-        return {"erro": "Base de dados não inicializada."}
+        return {"kpis": {"total_cats": 0, "obitos": 0, "com_afastamento": 0}, "ranking_cids": {}}
 
-    df_filtrado = aplicar_filtros(cnae, uf)
+    df_filtrado = aplicar_filtros(df_cat, cnae, uf)
     if df_filtrado.empty:
-        return {"mensagem": "Nenhum registro encontrado para estes filtros."}
+        return {"kpis": {"total_cats": 0, "obitos": 0, "com_afastamento": 0}, "ranking_cids": {}}
 
     total_cats = len(df_filtrado)
     obitos = len(df_filtrado[df_filtrado['Indica Óbito Acidente'].astype(str).str.upper() == 'SIM'])
@@ -190,12 +267,11 @@ def obter_resumo_cats(cnae: Optional[str] = None, uf: Optional[str] = None) -> d
         "ranking_cids": top_cids
     }
 
-
-def obter_evolucao(modo: str, ano: str, cnae: Optional[str] = None, uf: Optional[str] = None) -> list:
-    global df_cat
+@cache_query
+def obter_evolucao(df_cat: pd.DataFrame, modo: str, ano: str, cnae: Optional[str] = None, uf: Optional[str] = None) -> list:
     if df_cat.empty: return []
 
-    df_filtrado = aplicar_filtros(cnae, uf)
+    df_filtrado = aplicar_filtros(df_cat, cnae, uf)
     if ano != 'TODOS':
         df_filtrado = df_filtrado[df_filtrado['Ano'] == ano]
 
@@ -206,12 +282,11 @@ def obter_evolucao(modo: str, ano: str, cnae: Optional[str] = None, uf: Optional
 
     return [{"periodo": str(k), "cats": int(v)} for k, v in agrupado.items() if k != 'NaT' and k != '0']
 
-
-def obter_faixa_etaria(cnae: Optional[str] = None, uf: Optional[str] = None) -> list:
-    global df_cat
+@cache_query
+def obter_faixa_etaria(df_cat: pd.DataFrame, cnae: Optional[str] = None, uf: Optional[str] = None) -> list:
     if df_cat.empty: return []
 
-    df_filtrado = aplicar_filtros(cnae, uf)
+    df_filtrado = aplicar_filtros(df_cat, cnae, uf)
     df_filtrado['Data Nascimento Date'] = pd.to_datetime(df_filtrado['Data Nascimento'], format='%d/%m/%Y',
                                                          errors='coerce')
     df_filtrado['Idade'] = (df_filtrado['Data Acidente Date'] - df_filtrado['Data Nascimento Date']).dt.days / 365.25
@@ -223,12 +298,11 @@ def obter_faixa_etaria(cnae: Optional[str] = None, uf: Optional[str] = None) -> 
     agrupado = df_filtrado['Faixa'].value_counts().sort_index()
     return [{"faixa": str(k), "quantidade": int(v)} for k, v in agrupado.items()]
 
-
-def obter_top_estados(cnae: Optional[str] = None) -> list:
-    global df_cat
+@cache_query
+def obter_top_estados(df_cat: pd.DataFrame, cnae: Optional[str] = None) -> list:
     if df_cat.empty: return []
 
-    df_filtrado = aplicar_filtros(cnae, None)
+    df_filtrado = aplicar_filtros(df_cat, cnae, None)
     total = len(df_filtrado)
     if total == 0: return []
 
@@ -236,12 +310,11 @@ def obter_top_estados(cnae: Optional[str] = None) -> list:
     return [{"uf": str(k)[:20], "registros": f"{int(v / 1000)}k" if v >= 1000 else str(v),
              "percentual": round((v / total) * 100, 1)} for k, v in agrupado.items()]
 
-
-def obter_sexo(cnae: Optional[str] = None, uf: Optional[str] = None) -> list:
-    global df_cat
+@cache_query
+def obter_sexo(df_cat: pd.DataFrame, cnae: Optional[str] = None, uf: Optional[str] = None) -> list:
     if df_cat.empty: return []
 
-    df_filtrado = aplicar_filtros(cnae, uf)
+    df_filtrado = aplicar_filtros(df_cat, cnae, uf)
     total = len(df_filtrado)
     if total == 0: return []
 
